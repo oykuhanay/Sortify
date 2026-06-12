@@ -465,15 +465,27 @@ def group_detections(detections: List[Detection]) -> Tuple[List[Detection], Dict
     return blocks, fields
 
 
+def is_block_in_field(block: Detection, field: Detection) -> bool:
+    x1, y1, x2, y2 = field.xyxy
+    cx, cy = block.center
+    return x1 <= cx <= x2 and y1 <= cy <= y2
+
+
+COLOR_PRIORITY = {"red": 0, "blue": 1, "green": 2}
+
+
 def choose_nearest_sortable_block(
     robot: RobotPose,
     blocks: List[Detection],
     fields: Dict[str, Detection],
 ) -> Optional[Detection]:
-    sortable = [b for b in blocks if b.color in fields]
+    sortable = [
+        b for b in blocks
+        if b.color in fields and not is_block_in_field(b, fields[b.color])
+    ]
     if not sortable:
         return None
-    return min(sortable, key=lambda b: dist(robot.center, b.center))
+    return min(sortable, key=lambda b: (COLOR_PRIORITY.get(b.color, 99), dist(robot.center, b.center)))
 
 
 def get_lookahead_waypoint(robot: RobotPose, path: List[Point]) -> Optional[Point]:
@@ -512,7 +524,6 @@ class RobotCommander:
         if self.ser is not None:
             self.ser.write(msg)
         else:
-            # Debug mode: print only changes or periodic commands.
             if cmd != self.last_cmd or force:
                 print(f"SEND: {cmd}")
 

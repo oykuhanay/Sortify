@@ -31,10 +31,20 @@ class CameraError(RuntimeError):
 
 
 class Camera:
-    def __init__(self, index: int = DEFAULT_CAMERA_INDEX) -> None:
+    def __init__(
+        self,
+        index: int = DEFAULT_CAMERA_INDEX,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ) -> None:
         self._cap = cv2.VideoCapture(index)
         if not self._cap.isOpened():
             raise CameraError(f"could not open camera at index {index}")
+
+        if width is not None:
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        if height is not None:
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
         self._latest: Optional[np.ndarray] = None
         self._lock = threading.Lock()
