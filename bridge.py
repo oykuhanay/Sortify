@@ -33,16 +33,16 @@ The one exception is GRABBING/RELEASING — those are time-windowed,
 because while the gripper servo is moving we should not also be telling
 the wheels to roll. We use the wall clock to gate them.
 
-The robot is intentionally dumb: it just executes "TURN +030" / "MOVE 12.34"
+The robot is intentionally dumb: it just executes "TURN +030" / "MOVE +12.34"
 / "GRIP C" as fast as it can and pre-empts any in-flight movement when a
 new command arrives. All planning lives here on the Mac.
 
 Wire protocol (agreed with the robot firmware team):
     TURN +XXX        signed 3-digit angle in degrees (000-180). + = CW (right),
                      - = CCW (left). Examples: "TURN +030", "TURN -045".
-    MOVE XX.XX       unsigned 2.2 fixed-point distance in centimetres.
-                     Forward-only (the robot has no reverse). Example:
-                     "MOVE 12.34" drives 12.34 cm forward.
+    MOVE +XX.XX      signed 2.2 fixed-point distance in centimetres.
+                     + = forward, - = backward.
+                     Examples: "MOVE +12.34", "MOVE -05.00".
     GRIP C / GRIP O  close / open the gripper servo.
     STOP             emergency stop.
 
@@ -245,9 +245,10 @@ def _format_turn(deg: int) -> str:
 
 
 def _format_move(cm: float) -> str:
-    """Pack an unsigned cm distance into 'MOVE XX.XX'. Forward-only."""
-    cm = max(0.0, min(99.99, cm))
-    return f"MOVE {cm:05.2f}"
+    """Pack a signed cm distance into 'MOVE +XX.XX' / 'MOVE -XX.XX'."""
+    cm = max(-99.99, min(99.99, cm))
+    sign = "+" if cm >= 0 else "-"
+    return f"MOVE {sign}{abs(cm):05.2f}"
 
 
 def _pick_target_color(vision: dict) -> Optional[str]:
