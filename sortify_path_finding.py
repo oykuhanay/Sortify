@@ -288,15 +288,14 @@ def build_occupancy_grid(
     frame_shape: Tuple[int, int, int],
     detections: List[Detection],
     target_block: Optional[Detection],
+    robot_radius: float = ROBOT_RADIUS_PX,
 ) -> np.ndarray:
     """
     Returns grid[y, x]. 0 = free, 1 = occupied.
 
-    For first demo:
-    - Boundaries are obstacles.
-    - Other blocks are obstacles because the robot should not hit them.
-    - Target block is NOT an obstacle because the robot must approach it.
-    - Fields are not obstacles; they are zones on the floor.
+    robot_radius: clearance in pixels (should reflect actual robot footprint size).
+    Non-target blocks and frame borders are inflated by this radius so A* routes
+    the robot's *center* at least robot_radius pixels away from every obstacle edge.
     """
     h, w = frame_shape[:2]
     gw = int(math.ceil(w / GRID_SIZE_PX))
@@ -313,14 +312,14 @@ def build_occupancy_grid(
                 if not inside:
                     grid[gy, gx] = 1
 
-    # Keep a small border as obstacle.
-    border = max(1, int(ROBOT_RADIUS_PX / GRID_SIZE_PX))
+    # Keep a border at least robot_radius wide as obstacle.
+    border = max(1, int(robot_radius / GRID_SIZE_PX))
     grid[:border, :] = 1
     grid[-border:, :] = 1
     grid[:, :border] = 1
     grid[:, -border:] = 1
 
-    # Inflate non-target blocks.
+    # Inflate non-target blocks by robot_radius so the robot center stays clear.
     for det in detections:
         if det.kind != "block":
             continue
@@ -328,10 +327,10 @@ def build_occupancy_grid(
             continue
 
         x1, y1, x2, y2 = det.xyxy
-        x1 -= ROBOT_RADIUS_PX
-        y1 -= ROBOT_RADIUS_PX
-        x2 += ROBOT_RADIUS_PX
-        y2 += ROBOT_RADIUS_PX
+        x1 -= robot_radius
+        y1 -= robot_radius
+        x2 += robot_radius
+        y2 += robot_radius
 
         gx1 = max(0, int(x1 // GRID_SIZE_PX))
         gy1 = max(0, int(y1 // GRID_SIZE_PX))
