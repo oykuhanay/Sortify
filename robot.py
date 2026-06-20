@@ -52,7 +52,7 @@ from bleak import BleakClient, BleakScanner
 DEFAULT_DEVICE_NAME = "BT05"
 CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 SCAN_TIMEOUT_SEC = 8.0
-HEARTBEAT_SEC = 10.0      # how often to send PING to keep the link warm
+HEARTBEAT_SEC = 10.0       # how often to send PING to keep the link warm
 RECONNECT_BACKOFF_SEC = 1.0
 
 
