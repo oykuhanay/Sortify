@@ -7,14 +7,19 @@ keypoint model adds (gripper_pos) are used when available, with the
 robot's center as fallback so the bridge still works on older builds.
 
     {
-        "robot_center": (x, y),                # required; from ArUco marker
+        "robot_center": (x_cm, y_cm),          # required; world coords (cm)
         "theta_deg": float,                    # required; from ArUco marker
-        "gripper_pos": (x, y) | None,          # optional; from keypoint model
-        "blocks_by_color": {"red": [(x, y), ...], "blue": [...], ...},
-        "fields_by_color": {"red": (x, y), "blue": (x, y), ...},
-        "path_to_block":   [(x, y), ...],      # A* from main.py
-        "path_to_field":   [(x, y), ...],      # A* from main.py
+        "gripper_pos": (x_cm, y_cm) | None,    # optional; world coords (cm)
+        "blocks_by_color": {"red": [(x_cm, y_cm), ...], "blue": [...], ...},
+        "fields_by_color": {"red": (x_cm, y_cm), "blue": (x_cm, y_cm), ...},
+        "path_to_block":   [(x_cm, y_cm), ...],
+        "path_to_field":   [(x_cm, y_cm), ...],
     }
+
+    Everything is in world centimetres now — main.py applies a homography
+    so distances and angles match physical reality regardless of where on
+    the playing field the robot is. Pixel-space measurements got fooled by
+    perspective near the edges of the frame.
 
 Decisions:
 
@@ -69,18 +74,13 @@ Point = Tuple[float, float]
 # forward. With 10° the robot drives whenever roughly aimed, then a longer
 # move naturally corrects whatever drift is left.
 ANGLE_TOLERANCE_DEG = 10.0      # under this heading error, just drive
-WAYPOINT_REACHED_PX = 25.0      # skip waypoints we've already passed
-# Generous on purpose: at 40 px the cube was already inside the jaws but
+WAYPOINT_REACHED_CM = 2.5       # skip waypoints we've already passed (cm)
+# Generous on purpose: at 4 cm the cube was already inside the jaws but
 # the bridge still wanted to drive forward, so it kept trying to overshoot
-# instead of closing. 80 px latches the grab as soon as the cube is solidly
+# instead of closing. 8 cm latches the grab as soon as the cube is solidly
 # within reach; the throttle interval gives the wheels time to brake.
-BLOCK_GRAB_RADIUS_PX = 80.0     # gripper this close to block -> grab
-FIELD_RELEASE_RADIUS_PX = 90.0  # gripper this close to field -> release
-
-# Pixels-to-centimetres scale of the overhead camera. Measure once with a
-# ruler on the table. Until then ~10 px/cm is a reasonable guess for a
-# 1920-wide image of a ~50 cm play area.
-PX_PER_CM = 10.0
+BLOCK_GRAB_RADIUS_CM = 3.0      # gripper this close to block -> grab
+FIELD_RELEASE_RADIUS_CM = 8.0   # gripper this close to field -> release
 
 # Per-command size caps. Small + frequent beats large + sparse for stable
 # closed-loop control. The robot's wheels turn the chassis fast enough that
@@ -94,12 +94,12 @@ PX_PER_CM = 10.0
 # rotate the wheels.
 MOVE_CM_MIN = 0.50              # ignore noise-level moves
 # Per-state forward step caps. The block-approach cap is conservative
-# because we have to stop within ±BLOCK_GRAB_RADIUS_PX of the cube — too
+# because we have to stop within ±BLOCK_GRAB_RADIUS_CM of the cube — too
 # big a step and we overshoot, knock the cube away, or miss the grab. The
 # field-approach cap is larger because the field is a big open rectangle
 # and there's nothing fragile to crash into between us and it.
-MOVE_CM_MAX_BLOCK = 4.00        # max forward step while seeking the block
-MOVE_CM_MAX_FIELD = 5.00        # max forward step while seeking the field
+MOVE_CM_MAX_BLOCK = 5.00        # max forward step while seeking the block
+MOVE_CM_MAX_FIELD = 7.00        # max forward step while seeking the field
 TURN_DEG_MIN = 10               # smallest turn that physically rotates the chassis
 TURN_DEG_MAX = 10               # max turn per command
 BACKOFF_CM = 10.00              # how far to reverse after releasing a cube
@@ -221,7 +221,7 @@ class Bridge:
 
         # Close enough to attempt grab — distance measured from the gripper,
         # not the robot center, because that's what actually touches the cube.
-        if _dist(gripper_xy, block_xy) <= BLOCK_GRAB_RADIUS_PX:
+        if _dist(gripper_xy, block_xy) <= BLOCK_GRAB_RADIUS_CM:
             if not self._stop_sent:
                 self._stop_sent = True
                 return "STOP"
@@ -231,9 +231,14 @@ class Bridge:
             self.gripper_open = False
             return "GRIP C"
 
-        # Otherwise follow the planner's A* path to the block.
-        path = vision.get("path_to_block") or [block_xy]
-        return _drive_along_path(robot_xy, theta, path, MOVE_CM_MAX_BLOCK)
+        # Drive straight at the block. A* path_to_block was unreliable in
+        # tests — its first waypoint sometimes sat behind the robot
+        # because the pixel grid start cell wasn't exactly under the
+        # robot, which made the bridge pick a waypoint that pointed the
+        # wrong way and the robot would spin off in the opposite
+        # direction. The block is a single target on open ground; nothing
+        # we'd plan around between us and it.
+        return _drive_along_path(robot_xy, theta, [block_xy], MOVE_CM_MAX_BLOCK)
 
     def _tick_grabbing(self) -> Optional[str]:
         # Once the servo has had time to close around the cube, head for the
@@ -252,7 +257,7 @@ class Bridge:
             # Field briefly out of view; keep holding, don't drive blindly.
             return None
 
-        if _dist(gripper_xy, field_xy) <= FIELD_RELEASE_RADIUS_PX:
+        if _dist(gripper_xy, field_xy) <= FIELD_RELEASE_RADIUS_CM:
             if not self._stop_sent:
                 self._stop_sent = True
                 return "STOP"
@@ -313,7 +318,7 @@ def _heading_to(src: Point, dst: Point) -> float:
 
 def _pick_target_waypoint(robot_xy: Point, path: Sequence[Point]) -> Optional[Point]:
     for wp in path:
-        if _dist(robot_xy, wp) > WAYPOINT_REACHED_PX:
+        if _dist(robot_xy, wp) > WAYPOINT_REACHED_CM:
             return (float(wp[0]), float(wp[1]))
     return None
 
@@ -334,7 +339,7 @@ def _drive_along_path(robot_xy, theta, path, move_cm_max: float) -> Optional[str
         mag = max(TURN_DEG_MIN, min(TURN_DEG_MAX, int(round(abs(error)))))
         turn = mag if error >= 0 else -mag
         return _format_turn(turn)
-    distance_cm = _dist(robot_xy, target) / PX_PER_CM
+    distance_cm = _dist(robot_xy, target)   # vision feeds us world cm already
     if distance_cm < MOVE_CM_MIN:
         return None
     distance_cm = min(move_cm_max, distance_cm)
@@ -373,7 +378,7 @@ def _nearest_block_of_color(
     candidates = []
     for b in blocks:
         # Skip cubes already inside their target field.
-        if field_xy is not None and _dist(b, field_xy) <= FIELD_RELEASE_RADIUS_PX:
+        if field_xy is not None and _dist(b, field_xy) <= FIELD_RELEASE_RADIUS_CM:
             continue
         candidates.append(b)
     if not candidates:
