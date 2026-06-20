@@ -1,8 +1,8 @@
 from pathlib import Path
 from PIL import Image, ImageOps
 
-folder = Path("/Users/apple/Desktop/Sortify/w_robot")  # change this to your folder path
-
+folder = Path("/Users/apple/Desktop/Keypoint/test/images")  # change this to your folder path
+""
 valid_extensions = {".jpg", ".jpeg", ".png", ".webp"}
 
 for file_path in folder.iterdir():
