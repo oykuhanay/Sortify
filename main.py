@@ -80,7 +80,7 @@ DETECTION_MODEL_PATH = "best_finetuned.pt"   # YOLO bounding-box model (blocks +
 # never finish a single pulse before the next override arrives. 2 s gives
 # each small step (2 cm or 5 deg) plenty of time to execute and the camera
 # time to see the new pose before we plan again.
-COMMAND_INTERVAL_SEC = 1.3
+COMMAND_INTERVAL_SEC = 0.9
 
 # Motor trims pushed at startup. The chassis is asymmetric (left motor
 # pulls harder) so the right side runs higher to keep it tracking straight.
@@ -125,6 +125,10 @@ def _start_robot_thread():
                 # was tested against. Send STOP only so we know motors
                 # are idle in case the firmware was mid-pulse.
                 await r.send("STOP")
+                # Always open the gripper at startup so we don't have to
+                # manually GRIP O after a crash/restart with jaws still closed.
+                await asyncio.sleep(0.3)
+                await r.send("GRIP O")
                 print(f"[WP4] Robot connected (BT05). (Trims left at firmware defaults.)")
             except RobotError as e:
                 print(f"[WP4] Robot connect failed: {e}.  Driving will be no-op.")

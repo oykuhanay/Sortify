@@ -115,7 +115,7 @@ MOVE_CM_MIN = 0.40              # ignore noise-level moves
 # the field, which is what the operator asked for.
 NEAR_THRESHOLD_CM       = 10.0          # default; SEEKING_BLOCK uses this
 NEAR_THRESHOLD_CM_FIELD = 6.0           # SEEKING_FIELD: stay in FAR mode longer
-MOVE_CM_MAX_FAR       = 5.00    # forward step when target is far away
+MOVE_CM_MAX_FAR       = 3.00    # forward step when target is far away
 MOVE_CM_MAX_NEAR      = 1.50    # forward step when we're close to target
 
 # Default turn caps (SEEKING_BLOCK, INIT, etc.)
@@ -130,10 +130,10 @@ TURN_DEG_MIN          = 3       # absolute floor — anything lower can't break 
 # SEEKING_FIELD turn caps: faster than block but not crazy. 30°/15°
 # was overshooting and oscillating left-right; 20°/12° still closes
 # the angle quickly without spinning past it.
-TURN_HUGE_ERROR_DEG_FIELD = 90.0
-TURN_DEG_HUGE_FIELD       = 20
+TURN_HUGE_ERROR_DEG_FIELD = 45.0
+TURN_DEG_HUGE_FIELD       = 25
 TURN_DEG_FAR_FIELD        = 12
-BACKOFF_CM            = 8.00    # how far to reverse after releasing a cube
+BACKOFF_CM            = 6.00    # how far to reverse after releasing a cube
 
 # Servo + reverse settle times — the bridge stays quiet during these so the
 # robot can finish what we just told it to do without conflicting commands.
