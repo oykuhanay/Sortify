@@ -61,6 +61,21 @@ Real-time detection started (camera 0). Press Q or ESC to quit.
 
 Robot bağlanamazsa: `[WP4] Robot connect failed: BT05 not found.` → robotu kontrol et, tekrar başlat.
 
+### Web Dashboard
+
+`main.py` başlatıldıktan sonra tarayıcıdan **`http://127.0.0.1:8080`** aç:
+
+- Canlı MJPEG video akışı (OpenCV penceresiyle aynı görüntü — overlay'lerle birlikte)
+- Bridge state / target colour / son komut / robot bağlantı durumu / FPS
+- START / RESET / STOP butonları (SPACE / R / acil stop karşılığı)
+- Renk seçici (red / blue / green / auto)
+- Macro butonları ("Move red cube to red field" gibi — target + START)
+- Live tune slider'ları (gripper FWD / RIGHT, parallax, nadir x,y)
+- "Save tunables.json" / "Reset to defaults"
+- Manuel komut kutusu (`GRIP O`, `MOVE +5.00`, `TURN +010` vs. — direkt BLE'ye)
+
+Dashboard opt-in: bağlanılmazsa veya port 8080 başkası tarafından tutuluyorsa `main.py` çökmeden devam eder.
+
 ## 6) Operatör Tuşları
 
 Pencere üstünde:

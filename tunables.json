@@ -1,0 +1,9 @@
+{
+  "gripper_forward_cm": 20.0,
+  "gripper_right_cm": 0.0,
+  "parallax_factor": 0.18,
+  "camera_nadir_cm": [
+    50.0,
+    35.0
+  ]
+}

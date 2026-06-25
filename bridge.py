@@ -92,17 +92,48 @@ FIELD_RELEASE_RADIUS_CM = 8.0   # gripper this close to field -> release
 # sits in place reporting the same heading error frame after frame. 15°
 # pulses are short enough not to overshoot but long enough to actually
 # rotate the wheels.
-MOVE_CM_MIN = 0.50              # ignore noise-level moves
-# Per-state forward step caps. The block-approach cap is conservative
-# because we have to stop within ±BLOCK_GRAB_RADIUS_CM of the cube — too
-# big a step and we overshoot, knock the cube away, or miss the grab. The
-# field-approach cap is larger because the field is a big open rectangle
-# and there's nothing fragile to crash into between us and it.
-MOVE_CM_MAX_BLOCK = 5.00        # max forward step while seeking the block
-MOVE_CM_MAX_FIELD = 7.00        # max forward step while seeking the field
-TURN_DEG_MIN = 10               # smallest turn that physically rotates the chassis
-TURN_DEG_MAX = 10               # max turn per command
-BACKOFF_CM = 10.00              # how far to reverse after releasing a cube
+MOVE_CM_MIN = 0.40              # ignore noise-level moves
+# Driving has two distance modes and an extra big-error turn mode on top.
+#
+# Distance modes — handoff at NEAR_THRESHOLD_CM, measured from the
+# gripper to the target:
+#   FAR  — robot is rolling toward a faraway target; big steps OK.
+#   NEAR — gripper is close; small steps so we don't overshoot the cube.
+#
+# Turn modes — three:
+#   HUGE  : heading error >= TURN_HUGE_ERROR_DEG. Used regardless of
+#           distance, because a 150°-off robot would otherwise take
+#           20+ pulses to face the cube.
+#   FAR   : normal far-mode pulse.
+#   NEAR  : we're close, so any pulse should be small to avoid spinning
+#           past the cube and losing the marker out of frame.
+# Per-state NEAR threshold. The block approach has to be precise (the
+# cube has to end up inside the jaws), so we slow down well before
+# arrival. The field approach doesn't — we already have the cube; the
+# field is a big rectangle and any spot inside it counts. Smaller
+# field-near threshold = robot keeps cruising until almost touching
+# the field, which is what the operator asked for.
+NEAR_THRESHOLD_CM       = 10.0          # default; SEEKING_BLOCK uses this
+NEAR_THRESHOLD_CM_FIELD = 6.0           # SEEKING_FIELD: stay in FAR mode longer
+MOVE_CM_MAX_FAR       = 5.00    # forward step when target is far away
+MOVE_CM_MAX_NEAR      = 1.50    # forward step when we're close to target
+
+# Default turn caps (SEEKING_BLOCK, INIT, etc.)
+TURN_HUGE_ERROR_DEG   = 120.0   # above this heading error, use the big pulse
+TURN_DEG_HUGE         = 25      # turn pulse when the heading error is huge
+TURN_DEG_FAR          = 10      # turn pulse when target is far but heading isn't huge
+TURN_DEG_NEAR         = 5       # turn pulse when we're close to the target
+TURN_DEG_VERY_NEAR    = 3       # turn pulse when target is in the jaws — tiny so we don't kick the cube away
+VERY_NEAR_THRESHOLD_CM = 7.0    # gripper-to-target distance for "very near" turn mode
+TURN_DEG_MIN          = 3       # absolute floor — anything lower can't break stiction
+
+# SEEKING_FIELD turn caps: faster than block but not crazy. 30°/15°
+# was overshooting and oscillating left-right; 20°/12° still closes
+# the angle quickly without spinning past it.
+TURN_HUGE_ERROR_DEG_FIELD = 90.0
+TURN_DEG_HUGE_FIELD       = 20
+TURN_DEG_FAR_FIELD        = 12
+BACKOFF_CM            = 8.00    # how far to reverse after releasing a cube
 
 # Servo + reverse settle times — the bridge stays quiet during these so the
 # robot can finish what we just told it to do without conflicting commands.
@@ -192,6 +223,15 @@ class Bridge:
             return self._tick_seeking_block(vision, robot_xy, theta, gripper_xy)
         if self.state == State.SEEKING_FIELD:
             return self._tick_seeking_field(vision, robot_xy, theta, gripper_xy)
+        # IDLE — but if a new cube/field combo became visible (e.g. the
+        # operator dropped a fresh cube on the field, or vision finally
+        # picked up the green pair after we'd exhausted red) we should
+        # leave IDLE and try again instead of just sitting there.
+        if self.state == State.IDLE:
+            if _pick_target_color(vision) is not None:
+                print("[BRIDGE] IDLE -> SEEKING_BLOCK (new candidate visible)")
+                self.state = State.SEEKING_BLOCK
+                self.target_color = None     # re-pick in the next tick
         return None  # IDLE
 
     # --- state handlers ----------------------------------------------
@@ -215,9 +255,31 @@ class Bridge:
 
         block_xy = _nearest_block_of_color(vision, self.target_color, robot_xy)
         if block_xy is None:
-            # That colour is gone or fully sorted -> try another colour.
+            # Vision lost the cube. There are two flavours of this:
+            #
+            # 1) We already sent STOP because the cube was in range last
+            #    frame. The disappearance is the gripper closing on it
+            #    blocking the camera's view — that's exactly what we
+            #    want, take the win and move on to GRABBING.
+            #
+            # 2) We were still approaching and the cube blinked out for
+            #    a frame or two. Be patient: 15 frames of nothing before
+            #    we give up on this target.
+            if self._stop_sent:
+                # Branch 1: jaws are closing over the cube. Commit.
+                self.state = State.GRABBING
+                self._action_started_at = time.monotonic()
+                self._stop_sent = False
+                self.gripper_open = False
+                return "GRIP C"
+            self._target_miss_frames = getattr(self, "_target_miss_frames", 0) + 1
+            if self._target_miss_frames < 15:
+                return None       # patience; just don't drive this tick
+            self._target_miss_frames = 0
             self.target_color = None
             return None
+        # Saw it this frame; reset the patience counter.
+        self._target_miss_frames = 0
 
         # Close enough to attempt grab — distance measured from the gripper,
         # not the robot center, because that's what actually touches the cube.
@@ -238,7 +300,7 @@ class Bridge:
         # wrong way and the robot would spin off in the opposite
         # direction. The block is a single target on open ground; nothing
         # we'd plan around between us and it.
-        return _drive_along_path(robot_xy, theta, [block_xy], MOVE_CM_MAX_BLOCK)
+        return _drive_along_path(robot_xy, theta, [block_xy], gripper_xy)
 
     def _tick_grabbing(self) -> Optional[str]:
         # Once the servo has had time to close around the cube, head for the
@@ -257,7 +319,32 @@ class Bridge:
             # Field briefly out of view; keep holding, don't drive blindly.
             return None
 
-        if _dist(gripper_xy, field_xy) <= FIELD_RELEASE_RADIUS_CM:
+        # Drop once the gripper is comfortably INSIDE the field
+        # rectangle. We don't need to hit the centre — anywhere a few
+        # cm in from the edge is fine — but the previous "any point
+        # inside the bbox" check let the robot release on the field's
+        # outer rim, so the cube ended up on the cardboard, not on
+        # the colour. FIELD_RELEASE_INSET_CM pulls the trigger zone
+        # inward so the cube lands well clear of the edge.
+        FIELD_RELEASE_INSET_CM = 2.0
+        field_box = (vision.get("field_boxes_by_color") or {}).get(self.target_color)
+        if field_box is not None:
+            x1, y1, x2, y2 = field_box
+            xmin, xmax = min(x1, x2), max(x1, x2)
+            ymin, ymax = min(y1, y2), max(y1, y2)
+            inset = FIELD_RELEASE_INSET_CM
+            # Guard against pathological tiny bboxes — if the field is
+            # smaller than 2*inset the inset would invert and nothing
+            # would ever count as inside.
+            if xmax - xmin > 2 * inset and ymax - ymin > 2 * inset:
+                xmin += inset; xmax -= inset
+                ymin += inset; ymax -= inset
+            inside = (xmin <= gripper_xy[0] <= xmax
+                      and ymin <= gripper_xy[1] <= ymax)
+        else:
+            inside = _dist(gripper_xy, field_xy) <= FIELD_RELEASE_RADIUS_CM
+
+        if inside:
             if not self._stop_sent:
                 self._stop_sent = True
                 return "STOP"
@@ -273,7 +360,13 @@ class Bridge:
         # and the heading we'd compute from it is meaningless. The field is
         # an open coloured rectangle on flat cardboard — there's nothing
         # between us and it that needs planning around.
-        return _drive_along_path(robot_xy, theta, [field_xy], MOVE_CM_MAX_FIELD)
+        return _drive_along_path(
+            robot_xy, theta, [field_xy], gripper_xy,
+            near_threshold_cm=NEAR_THRESHOLD_CM_FIELD,
+            turn_huge_error_deg=TURN_HUGE_ERROR_DEG_FIELD,
+            turn_deg_huge=TURN_DEG_HUGE_FIELD,
+            turn_deg_far=TURN_DEG_FAR_FIELD,
+        )
 
     def _tick_releasing(self) -> Optional[str]:
         if time.monotonic() - self._action_started_at >= GRIP_SETTLE_SEC:
@@ -323,27 +416,91 @@ def _pick_target_waypoint(robot_xy: Point, path: Sequence[Point]) -> Optional[Po
     return None
 
 
-def _drive_along_path(robot_xy, theta, path, move_cm_max: float) -> Optional[str]:
+def _drive_along_path(robot_xy, theta, path, gripper_xy=None,
+                      near_threshold_cm: float = NEAR_THRESHOLD_CM,
+                      turn_huge_error_deg: float = TURN_HUGE_ERROR_DEG,
+                      turn_deg_huge: int = TURN_DEG_HUGE,
+                      turn_deg_far: int = TURN_DEG_FAR) -> Optional[str]:
     """Emit either a TURN or a MOVE that nudges the robot toward the next
-    A* waypoint. Step sizes shrink with distance to keep the approach stable.
-    Caller supplies `move_cm_max` so block-approach (small steps, no overshoot)
-    and field-approach (big steps, open ground) can have different ceilings."""
+    waypoint. Switches between FAR and NEAR modes at `near_threshold_cm`:
+    far targets get big pulses (cover ground), close ones get small
+    pulses (don't overshoot the cube).
+
+    `near` is measured from the GRIPPER to the target, not the marker
+    centre — the gripper sits ~20 cm ahead of the marker, so using the
+    marker would falsely report "far away" even when the jaws are
+    practically over the cube.
+
+    Per-state callers can lower `near_threshold_cm` so the field
+    approach doesn't crawl: dropping off doesn't need cube-grab
+    precision. They can also pass bigger turn caps for the same reason
+    — SEEKING_FIELD doesn't care about overshoot, just about getting
+    pointed at the rectangle fast."""
     target = _pick_target_waypoint(robot_xy, path)
     if target is None:
         return None
-    error = _normalize_deg(_heading_to(robot_xy, target) - theta)
-    if abs(error) > ANGLE_TOLERANCE_DEG:
-        # Floor the magnitude at TURN_DEG_MIN so the wheels actually rotate
-        # (the firmware's deg-to-ms conversion makes <10° pulses too short
-        # to break stiction). Sign comes from `error`.
-        mag = max(TURN_DEG_MIN, min(TURN_DEG_MAX, int(round(abs(error)))))
+    # Distance the wheels actually need to roll. We always drive the
+    # robot CENTRE forward (that's what TURN/MOVE move), but we judge
+    # "are we close" from the gripper because the gripper is what
+    # eventually has to be over the cube.
+    distance_cm = _dist(robot_xy, target)
+    proximity_xy = gripper_xy if gripper_xy is not None else robot_xy
+    near = _dist(proximity_xy, target) <= near_threshold_cm
+
+    # Heading error. When we're close to the cube, "robot pointed at
+    # target" isn't enough — the gripper sits 20 cm ahead of the
+    # marker, so a few degrees off-axis from the marker becomes a
+    # gripper that's beside the cube instead of around it. In NEAR
+    # mode we therefore measure the heading from the GRIPPER to the
+    # target, which catches that lateral drift. The tolerance also
+    # tightens to 4° so we re-aim before we ram the cube sideways.
+    proximity_dist = _dist(proximity_xy, target)
+    if near and gripper_xy is not None:
+        error = _normalize_deg(_heading_to(gripper_xy, target) - theta)
+        # In NEAR mode we measure from the gripper, and the closer we
+        # get the more meaningless a few degrees of sideways drift
+        # actually is — at 5 cm a 10° error is only 0.9 cm of lateral
+        # offset, which is well inside the jaws. Tightening the
+        # tolerance at that distance just makes the robot twitch
+        # left-right forever instead of driving the last cm forward
+        # and closing. So: linear loosening as we approach.
+        #   25 cm  -> 4°      (tight; we still have room to re-aim)
+        #    7 cm  -> 12°     (loose; just drive in)
+        #    0 cm  -> 18°     (effectively pinned, MOVE only)
+        if proximity_dist <= 7.0:
+            # Map (0..7) -> (18..12)
+            t = max(0.0, proximity_dist / 7.0)
+            tolerance = 18.0 - 6.0 * t
+        else:
+            # Map (7..25) -> (12..4)
+            t = max(0.0, min(1.0, (proximity_dist - 7.0) / (25.0 - 7.0)))
+            tolerance = 12.0 - 8.0 * t
+    else:
+        error = _normalize_deg(_heading_to(robot_xy, target) - theta)
+        tolerance = ANGLE_TOLERANCE_DEG
+    if abs(error) > tolerance:
+        # Four-tier turn cap:
+        #   VERY NEAR (cube basically in the jaws): 3° nudges so we
+        #     don't pivot the chassis enough to bat the cube sideways
+        #     and end up chasing it left-right forever.
+        #   HUGE error: big bite, doesn't matter how far.
+        #   NEAR distance: small 5° pulses.
+        #   Otherwise: caller-supplied far pulse.
+        if proximity_dist <= VERY_NEAR_THRESHOLD_CM:
+            turn_cap = TURN_DEG_VERY_NEAR
+        elif abs(error) >= turn_huge_error_deg:
+            turn_cap = turn_deg_huge
+        elif near:
+            turn_cap = TURN_DEG_NEAR
+        else:
+            turn_cap = turn_deg_far
+        mag = max(TURN_DEG_MIN, min(turn_cap, int(round(abs(error)))))
         turn = mag if error >= 0 else -mag
         return _format_turn(turn)
-    distance_cm = _dist(robot_xy, target)   # vision feeds us world cm already
     if distance_cm < MOVE_CM_MIN:
         return None
-    distance_cm = min(move_cm_max, distance_cm)
-    return _format_move(distance_cm)
+    move_cap = MOVE_CM_MAX_NEAR if near else MOVE_CM_MAX_FAR
+    return _format_move(min(move_cap, distance_cm))
 
 
 def _format_turn(deg: int) -> str:
@@ -360,10 +517,38 @@ def _format_move(cm: float) -> str:
 
 
 def _pick_target_color(vision: dict) -> Optional[str]:
-    blocks = vision.get("blocks_by_color") or {}
-    fields = vision.get("fields_by_color") or {}
+    """Pick the highest-priority colour that has at least one cube NOT
+    already sitting on its matching field. Without the bbox filter we'd
+    forever re-pick `red` once the red cube is sorted: there's still a
+    red block and a red field in the scene, so the old check passed,
+    but `_nearest_block_of_color` would then filter the only candidate
+    and return None, and we'd spin in circles instead of advancing to
+    green."""
+    blocks_by_color = vision.get("blocks_by_color") or {}
+    fields_by_color = vision.get("fields_by_color") or {}
+    field_boxes_by_color = vision.get("field_boxes_by_color") or {}
     for color in COLOR_PRIORITY:
-        if blocks.get(color) and color in fields:
+        if color not in fields_by_color:
+            continue
+        cubes = blocks_by_color.get(color) or []
+        if not cubes:
+            continue
+        # Use the same containment logic as _nearest_block_of_color so
+        # the two never disagree about whether a cube is sorted.
+        field_box = field_boxes_by_color.get(color)
+        unsorted_exists = False
+        for b in cubes:
+            if field_box is not None:
+                x1, y1, x2, y2 = field_box
+                xmin, xmax = min(x1, x2), max(x1, x2)
+                ymin, ymax = min(y1, y2), max(y1, y2)
+                inset = 1.0
+                if (xmin - inset <= b[0] <= xmax + inset
+                        and ymin - inset <= b[1] <= ymax + inset):
+                    continue
+            unsorted_exists = True
+            break
+        if unsorted_exists:
             return color
     return None
 
@@ -371,14 +556,31 @@ def _pick_target_color(vision: dict) -> Optional[str]:
 def _nearest_block_of_color(
     vision: dict, color: str, robot_xy: Point
 ) -> Optional[Point]:
+    """Pick the nearest cube of `color` that isn't already sitting on
+    its matching field. The 'already sorted' check uses the field's
+    bounding BOX (with a small inward inset) rather than distance to
+    the field's centre — fields are big rectangles and the cube can
+    land anywhere on them, including near the edges, so a centre-
+    distance check would re-target a cube we just dropped on the
+    field corner."""
     blocks = (vision.get("blocks_by_color") or {}).get(color) or []
     if not blocks:
         return None
+    field_box = (vision.get("field_boxes_by_color") or {}).get(color)
     field_xy = (vision.get("fields_by_color") or {}).get(color)
     candidates = []
     for b in blocks:
-        # Skip cubes already inside their target field.
-        if field_xy is not None and _dist(b, field_xy) <= FIELD_RELEASE_RADIUS_CM:
+        # Primary filter: cube physically on its destination field.
+        if field_box is not None:
+            x1, y1, x2, y2 = field_box
+            xmin, xmax = min(x1, x2), max(x1, x2)
+            ymin, ymax = min(y1, y2), max(y1, y2)
+            inset = 1.0   # 1 cm inward so cubes right on the edge still count as in
+            if (xmin - inset <= b[0] <= xmax + inset
+                    and ymin - inset <= b[1] <= ymax + inset):
+                continue
+        elif field_xy is not None and _dist(b, field_xy) <= FIELD_RELEASE_RADIUS_CM:
+            # Fallback when bbox isn't available — older vision dicts.
             continue
         candidates.append(b)
     if not candidates:

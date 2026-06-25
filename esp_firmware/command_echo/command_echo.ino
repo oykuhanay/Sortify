@@ -1,5 +1,5 @@
 // WP4 ESP-side firmware: parse Sortify commands, echo back ACKs.
-// AAA
+// AAAtesr1
 // Protocol (line-based, ASCII, '\n' terminated):
 //   TURN +030     turn 30 deg clockwise (right)   (signed 3-digit)
 //   TURN -045     turn 45 deg counter-clockwise   (signed 3-digit)
@@ -47,8 +47,8 @@ String buf = "";
 // the right, so the left trim runs much lower to keep the robot tracking
 // straight. Adjust live with TRIM commands; for slower motion drop both
 // proportionally (e.g. R=60, L=16.5 keeps the same 0.275 ratio).
-float r_m_speed = 80.00;  // A Motoru, 0-100 percent
-float l_m_speed = 22.00;  // B Motoru, 0-100 percent
+float r_m_speed = 60.00;  // A Motoru, 0-100 percent
+float l_m_speed = 60.00;  // B Motoru, 0-100 percent
 
 // Calibration constants: tune these by experiment.
 // How many cm the robot travels in 1 second of forward motion at the
@@ -214,14 +214,14 @@ void setRightMotor(int speed)
 
   if (speed > 0)
   {
-    digitalWrite(AIN1, LOW);
-    digitalWrite(AIN2, HIGH);
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
     analogWrite(PWMA, speed);
   }
   else if (speed < 0)
   {
-    digitalWrite(AIN1, HIGH);
-    digitalWrite(AIN2, LOW);
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
     analogWrite(PWMA, -speed);
   }
   else
@@ -333,11 +333,10 @@ void turnLeft(int durationMs)
 
 void stopMotors()
 {
-  // Cut PWM first so the driver stops sourcing current immediately,
-  // then drive direction pins low to put both motor channels in brake/idle.
-  // Forgetting to zero the PWM is what made the wheels keep spinning
-  // forever after a MOVE — direction = LOW + PWM != 0 leaves the driver
-  // in an undefined state on TB6612-style modules.
+  // Coast stop (safer for the TB6612 / cheap clones): just cut PWM and
+  // park direction pins LOW. The earlier "active short-brake" version
+  // (IN1+IN2 HIGH + PWM 1023) may have stressed the driver — reverted
+  // because the robot stopped moving entirely after a few brake cycles.
   analogWrite(PWMA, 0);
   analogWrite(PWMB, 0);
   digitalWrite(AIN1, LOW);

@@ -12,6 +12,7 @@ from camera import Camera
 from sortify_path_finding import Detection, build_occupancy_grid, astar
 from bridge import Bridge
 from robot import Robot, RobotError
+import web_dashboard
 
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
 ROBOT_MARKER_ID = 0
@@ -26,8 +27,14 @@ ROBOT_CLEARANCE_FACTOR = 0.6
 # The chassis is asymmetric so right ≠ 0.
 #   forward >0 = ahead of the marker, in the direction of theta
 #   right   >0 = to the marker's right (clockwise from theta)
-GRIPPER_FORWARD_CM = 20.0   # marker centre → between the jaws
-GRIPPER_RIGHT_CM   = 0.0    # chassis is symmetric; any side-drift is parallax
+GRIPPER_FORWARD_CM = 20.0   # marker centre → between the jaws (live-tunable)
+GRIPPER_RIGHT_CM   = 0.0    # chassis is symmetric; any side-drift is parallax (live-tunable)
+
+# Persistent live-tune config file. Loaded at startup if present, written
+# whenever the operator presses K in the OpenCV window. Lets us tweak
+# offsets and parallax without restarting main.py — the previous
+# stop/edit/start loop took 30-40 seconds per nudge.
+TUNABLES_PATH = "tunables.json"
 
 # Parallax correction.
 #
@@ -56,7 +63,7 @@ PARALLAX_FACTOR   = 0.18
 # sample contributes 25% and the EMA forgets the past with a half-life of
 # ~2.4 frames — enough to kill jitter, fast enough that the robot
 # actually moving is reflected immediately.
-MARKER_EMA_ALPHA = 0.25
+MARKER_EMA_ALPHA = 0.80
 
 # Homography file produced by calibrate_homography.py. Maps full-resolution
 # image pixels to world (cm) coordinates of the playing field. Without it
@@ -73,13 +80,13 @@ DETECTION_MODEL_PATH = "best_finetuned.pt"   # YOLO bounding-box model (blocks +
 # never finish a single pulse before the next override arrives. 2 s gives
 # each small step (2 cm or 5 deg) plenty of time to execute and the camera
 # time to see the new pose before we plan again.
-COMMAND_INTERVAL_SEC = 2.0
+COMMAND_INTERVAL_SEC = 1.3
 
 # Motor trims pushed at startup. The chassis is asymmetric (left motor
 # pulls harder) so the right side runs higher to keep it tracking straight.
 # Override live from the OpenCV window with the trim keys if needed.
 STARTUP_TRIM_RIGHT = 75.00
-STARTUP_TRIM_LEFT  = 25.00
+STARTUP_TRIM_LEFT  = 22.00
 
 
 # ---- WP4 BLE robot driver wiring ------------------------------------------
@@ -113,14 +120,12 @@ def _start_robot_thread():
                 r = Robot()
                 await r.connect()
                 _robot = r
-                # Push our calibrated trims as soon as the link is up so we
-                # don't drive with whatever the firmware happened to boot
-                # with. Order: STOP first to make sure the motors are idle
-                # in case the firmware was mid-pulse from a previous run.
+                # Don't override the firmware's trim values — whatever the
+                # ESP booted with (currently 60/60) is what the chassis
+                # was tested against. Send STOP only so we know motors
+                # are idle in case the firmware was mid-pulse.
                 await r.send("STOP")
-                await r.send(f"TRIM R {STARTUP_TRIM_RIGHT:.2f}")
-                await r.send(f"TRIM L {STARTUP_TRIM_LEFT:.2f}")
-                print(f"[WP4] Robot connected (BT05). Trims set R={STARTUP_TRIM_RIGHT:.2f} L={STARTUP_TRIM_LEFT:.2f}.")
+                print(f"[WP4] Robot connected (BT05). (Trims left at firmware defaults.)")
             except RobotError as e:
                 print(f"[WP4] Robot connect failed: {e}.  Driving will be no-op.")
             finally:
@@ -141,6 +146,81 @@ def _send_to_robot(command: str):
     asyncio.run_coroutine_threadsafe(_robot.send(command), _robot_loop)
 
 
+def _reconnect_robot() -> str:
+    """Force-tear-down and re-pair the BLE link. Called from the dashboard
+    Reconnect button when the link drops without auto-recovery. Runs the
+    coroutine on the bleak loop and waits up to 15 s for it to finish so
+    the HTTP handler can return a real status string."""
+    global _robot
+    if _robot_loop is None:
+        return "no robot loop"
+
+    async def _do() -> str:
+        global _robot
+        try:
+            if _robot is not None:
+                try:
+                    await _robot.disconnect()
+                except Exception:
+                    pass
+            r = Robot()
+            await r.connect()
+            await r.send("STOP")
+            _robot = r
+            return "connected"
+        except RobotError as e:
+            _robot = None
+            return f"failed: {e}"
+
+    fut = asyncio.run_coroutine_threadsafe(_do(), _robot_loop)
+    try:
+        return fut.result(timeout=15.0)
+    except Exception as e:
+        return f"reconnect timed out: {e}"
+
+
+def _start_ble_watchdog():
+    """Spawn a daemon thread that pokes _reconnect_robot whenever the
+    BLE link looks dead. robot.py has an internal heartbeat that tries
+    to reconnect every ~10 s, but in practice the macOS BLE stack
+    sometimes gets stuck and never recovers without a full pair-up
+    cycle. This watchdog does that pair-up cycle on its own when the
+    link has been down for `WATCHDOG_GRACE_SEC`."""
+    WATCHDOG_GRACE_SEC = 8.0
+    WATCHDOG_RETRY_SEC = 20.0   # don't hammer macOS BLE — failed retries cost ~15 s each
+
+    def loop():
+        last_attempt = 0.0
+        while True:
+            time.sleep(2.0)
+            try:
+                is_live = (
+                    _robot is not None
+                    and getattr(_robot, "_client", None) is not None
+                    and _robot._client.is_connected
+                )
+            except Exception:
+                is_live = False
+            if is_live:
+                continue
+            # Link looks dead. Wait for the grace period (robot.py's own
+            # heartbeat reconnect might still work) before we step in,
+            # then rate-limit our attempts.
+            now = time.monotonic()
+            if now - last_attempt < WATCHDOG_RETRY_SEC:
+                continue
+            last_attempt = now
+            print("[WP4] watchdog: BLE link down, attempting reconnect...")
+            try:
+                status = _reconnect_robot()
+                print(f"[WP4] watchdog: {status}")
+            except Exception as e:
+                print(f"[WP4] watchdog: reconnect raised {e}")
+
+    t = threading.Thread(target=loop, daemon=True, name="ble-watchdog")
+    t.start()
+
+
 def box_center(box):
     x1, y1, x2, y2 = map(int, box.xyxy[0])
     return ((x1 + x2) // 2, (y1 + y2) // 2)
@@ -150,6 +230,52 @@ def dist(a, b):
 
 def draw_arrow(frame, pt1, pt2, color, thickness=2):
     cv2.arrowedLine(frame, pt1, pt2, color, thickness, tipLength=0.04)
+
+def _load_tunables() -> dict:
+    """Read tunables.json if it exists; otherwise return {} so the
+    module-level defaults stand. Silent on read errors — bad JSON should
+    not crash the demo."""
+    import json, os
+    if not os.path.exists(TUNABLES_PATH):
+        return {}
+    try:
+        with open(TUNABLES_PATH, "r") as f:
+            data = json.load(f)
+        print(f"[WP4] Loaded tunables from {TUNABLES_PATH}: {data}")
+        return data
+    except Exception as e:
+        print(f"[WP4] Could not read {TUNABLES_PATH}: {e}. Using defaults.")
+        return {}
+
+
+def _reset_tunables(state: dict) -> None:
+    """Reset in-memory tunables to the module-level defaults. Mirrors the
+    '0' key in the OpenCV window so the dashboard's 'Reset to defaults'
+    button doesn't need to know what the defaults are."""
+    state["tun_gripper_forward_cm"] = GRIPPER_FORWARD_CM
+    state["tun_gripper_right_cm"]   = GRIPPER_RIGHT_CM
+    state["tun_parallax_factor"]    = PARALLAX_FACTOR
+    state["tun_camera_nadir_cm"]    = CAMERA_NADIR_CM
+    print("[WP4] Tunables reset to module defaults (not saved).")
+
+
+def _save_tunables(state: dict) -> None:
+    """Dump the live-tunable knobs to disk so a restart picks them up."""
+    import json
+    data = {
+        "gripper_forward_cm": float(state["tun_gripper_forward_cm"]),
+        "gripper_right_cm":   float(state["tun_gripper_right_cm"]),
+        "parallax_factor":    float(state["tun_parallax_factor"]),
+        "camera_nadir_cm":    [float(state["tun_camera_nadir_cm"][0]),
+                               float(state["tun_camera_nadir_cm"][1])],
+    }
+    try:
+        with open(TUNABLES_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[WP4] Saved tunables to {TUNABLES_PATH}: {data}")
+    except Exception as e:
+        print(f"[WP4] Could not write {TUNABLES_PATH}: {e}")
+
 
 def _load_homography():
     """Load the pixel->world homography produced by
@@ -171,8 +297,10 @@ def _load_homography():
 def run_detection(source, detection_model_path):
     H_pixel_to_world, H_world_to_pixel = _load_homography()
     _start_robot_thread()
+    _start_ble_watchdog()
     model = YOLO(detection_model_path)
     trail = collections.deque(maxlen=ROBOT_TRAIL_LEN)
+    tunables = _load_tunables()
     state = {
         "H_pixel_to_world": H_pixel_to_world,
         "H_world_to_pixel": H_world_to_pixel,
@@ -192,7 +320,36 @@ def run_detection(source, detection_model_path):
         # last good pixel snapshot.
         "last_pixel_center": None,
         "last_robot_radius_px": None,
+        # Live-tunable knobs. Loaded from tunables.json if present,
+        # mutated by keypresses in the OpenCV window, saved back with K.
+        # Module-level constants are just the initial defaults.
+        "tun_gripper_forward_cm": tunables.get("gripper_forward_cm", GRIPPER_FORWARD_CM),
+        "tun_gripper_right_cm":   tunables.get("gripper_right_cm",   GRIPPER_RIGHT_CM),
+        "tun_parallax_factor":    tunables.get("parallax_factor",    PARALLAX_FACTOR),
+        "tun_camera_nadir_cm":    tuple(tunables.get("camera_nadir_cm", CAMERA_NADIR_CM)),
+        # Last-clicked pixel (for setting nadir by click).
+        "pending_nadir_click_world": None,
     }
+
+    # Launch the localhost dashboard. Opt-in: if it can't bind (port
+    # taken, sandbox, whatever) the demo still runs from the OpenCV
+    # window. A daemon thread serves /, /status.json, /stream.mjpg and
+    # the POST control endpoints; everything mutates the same `state`
+    # the WASD keys do.
+    try:
+        web_dashboard.start_dashboard(
+            state, _bridge, _send_to_robot,
+            save_tunables=lambda: _save_tunables(state),
+            reset_tunables=lambda: _reset_tunables(state),
+            reconnect_robot=_reconnect_robot,
+        )
+    except Exception as e:
+        print(f"[WP4] Dashboard failed to start: {e}. Continuing without it.")
+
+    # FPS smoothing for the dashboard HUD. Cheap EMA over frame intervals;
+    # main.py is the only producer so we don't need a lock around the float.
+    state["_fps_last_t"] = None
+    state["fps"] = None
 
     try:
         cam_index = int(source)
@@ -204,10 +361,29 @@ def run_detection(source, detection_model_path):
     # fair chance to process keypresses; with waitKey(1) it often misses.
     #
     # Operator keys (the OpenCV window has to have focus):
-    #   SPACE or s/S  -> START the flow (leave AWAITING_START)
-    #   r / R         -> RESET back to AWAITING_START so we can re-align
-    #                    the robot by hand without restarting the script
-    #   q / Q / ESC   -> quit
+    #
+    #   Flow control
+    #     SPACE     START the flow (leave AWAITING_START)
+    #     R         RESET back to AWAITING_START so we can re-align
+    #     Q / ESC   quit
+    #
+    #   Live tune for the cyan gripper ring (no restart!)
+    #     W / S     gripper FORWARD offset ±1 cm   (towards / away from jaws)
+    #     A / D     gripper RIGHT   offset ±1 cm   (left / right of axis)
+    #     - / +     PARALLAX_FACTOR ±0.01          (corner-edge correction)
+    #     N         click on the image to set CAMERA_NADIR_CM there
+    #     K         save current tunables to tunables.json
+    #     0         reset all tunables to module defaults (in-memory only)
+    #
+    # Why two separate things to tune:
+    #   GRIPPER_FORWARD/RIGHT_CM is the *chassis geometry* — marker centre
+    #     to jaws. Fixed by the robot's build. If the ring sits in the same
+    #     wrong place no matter where the robot is on the field, change
+    #     these.
+    #   PARALLAX_FACTOR is the *camera-vs-marker-height* correction. The
+    #     ring drifts only near the corners of the field (and the direction
+    #     of drift depends on where the robot is). Change this when the
+    #     centre is fine but the corners aren't.
     def _handle_keys() -> bool:
         """Process one keypress. Returns True iff we should quit."""
         k = cv2.waitKey(20) & 0xFF
@@ -215,37 +391,96 @@ def run_detection(source, detection_model_path):
             return False
         if k in (ord("q"), ord("Q"), 27):
             return True
-        if k in (ord(" "), ord("s"), ord("S")):
+        if k == ord(" "):
             _bridge.start()
             print(f"[WP4] START -> {_bridge.state}")
         elif k in (ord("r"), ord("R")):
             _bridge.reset()
             print("[WP4] RESET -> AWAITING_START. Re-align the robot, then press SPACE.")
+        # Gripper offset tune — values are in cm of real-world distance.
+        elif k in (ord("w"), ord("W")):
+            state["tun_gripper_forward_cm"] += 1.0
+            print(f"[WP4] gripper FORWARD = {state['tun_gripper_forward_cm']:+.2f} cm")
+        elif k in (ord("s"), ord("S")):
+            state["tun_gripper_forward_cm"] -= 1.0
+            print(f"[WP4] gripper FORWARD = {state['tun_gripper_forward_cm']:+.2f} cm")
+        elif k in (ord("d"), ord("D")):
+            state["tun_gripper_right_cm"] += 1.0
+            print(f"[WP4] gripper RIGHT   = {state['tun_gripper_right_cm']:+.2f} cm")
+        elif k in (ord("a"), ord("A")):
+            state["tun_gripper_right_cm"] -= 1.0
+            print(f"[WP4] gripper RIGHT   = {state['tun_gripper_right_cm']:+.2f} cm")
+        # Parallax — note these are tiny steps; 0.01 is a meaningful change.
+        elif k in (ord("+"), ord("="), ord("]")):
+            state["tun_parallax_factor"] += 0.01
+            print(f"[WP4] PARALLAX_FACTOR = {state['tun_parallax_factor']:.3f}")
+        elif k in (ord("-"), ord("_"), ord("[")):
+            state["tun_parallax_factor"] -= 0.01
+            print(f"[WP4] PARALLAX_FACTOR = {state['tun_parallax_factor']:.3f}")
+        elif k in (ord("n"), ord("N")):
+            print("[WP4] Click anywhere on the frame to set CAMERA_NADIR_CM "
+                  "there (the spot directly under the camera lens).")
+            state["pending_nadir_click_world"] = "armed"
+        elif k in (ord("k"), ord("K")):
+            _save_tunables(state)
+        elif k == ord("0"):
+            state["tun_gripper_forward_cm"] = GRIPPER_FORWARD_CM
+            state["tun_gripper_right_cm"]   = GRIPPER_RIGHT_CM
+            state["tun_parallax_factor"]    = PARALLAX_FACTOR
+            state["tun_camera_nadir_cm"]    = CAMERA_NADIR_CM
+            print("[WP4] Tunables reset to module defaults (not saved).")
         return False
 
-    if use_camera:
-        with Camera(index=cam_index, width=3840, height=2160) as cam:
-            print(f"Real-time detection started (camera {cam_index}). Press Q or ESC to quit.")
+    # Create the window up front so we can attach a mouse callback for
+    # the "click to set nadir" feature. cv2.imshow would create it
+    # lazily; doing it here means setMouseCallback always finds it.
+    cv2.namedWindow("Sortify - Real-time Detection", cv2.WINDOW_AUTOSIZE)
+
+    def _on_mouse(event, x, y, _flags, _param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if state.get("pending_nadir_click_world") != "armed":
+            return
+        # Map the clicked pixel back to world cm via the homography.
+        wp = _to_world(state["H_pixel_to_world"], np.array([[x, y]]))[0]
+        state["tun_camera_nadir_cm"] = (float(wp[0]), float(wp[1]))
+        state["pending_nadir_click_world"] = None
+        print(f"[WP4] CAMERA_NADIR_CM = ({wp[0]:.1f}, {wp[1]:.1f}) cm")
+
+    cv2.setMouseCallback("Sortify - Real-time Detection", _on_mouse)
+
+    try:
+        if use_camera:
+            with Camera(index=cam_index, width=3840, height=2160) as cam:
+                print(f"Real-time detection started (camera {cam_index}). Press Q or ESC to quit.")
+                while True:
+                    frame = cam.get_frame()
+                    _process_frame(frame, model, trail, state)
+                    if _handle_keys():
+                        break
+        else:
+            cap = cv2.VideoCapture(source)
+            if not cap.isOpened():
+                sys.exit(f"Error: could not open source '{source}'")
+            print(f"Processing '{source}'. Press Q or ESC to quit.")
             while True:
-                frame = cam.get_frame()
+                ok, frame = cap.read()
+                if not ok:
+                    break
                 _process_frame(frame, model, trail, state)
                 if _handle_keys():
                     break
-    else:
-        cap = cv2.VideoCapture(source)
-        if not cap.isOpened():
-            sys.exit(f"Error: could not open source '{source}'")
-        print(f"Processing '{source}'. Press Q or ESC to quit.")
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            _process_frame(frame, model, trail, state)
-            if _handle_keys():
-                break
-        cap.release()
-
-    cv2.destroyAllWindows()
+            cap.release()
+    finally:
+        # Close the session recording (if we opened one) before tearing
+        # down the OpenCV window. VideoWriter's footer is only written
+        # on .release(); skipping this leaves an unplayable file.
+        writer = state.get("video_writer")
+        if writer is not None:
+            writer.release()
+            out_path = state.get("video_path")
+            print(f"[WP4] Saved session recording to {out_path}")
+        cv2.destroyAllWindows()
 
 
 
@@ -382,7 +617,13 @@ def draw_path_overlay(frame, robot_center, path_to_block, path_to_field, trail, 
 
 
 def _process_frame(frame, model, trail, state):
+    # Hand the full-resolution frame to YOLO. We tried downscaling to
+    # 1280 + imgsz=640 here for FPS — the model stopped detecting the
+    # big coloured fields (they fell outside the size distribution it
+    # was trained on) and the demo broke. Keep the full frame; we'll
+    # claw back FPS elsewhere (Iriun resolution, dashboard subsampling).
     results = model(frame, verbose=False)[0]
+    scaled_boxes = list(results.boxes)
 
     # --- detect robot marker, then convert everything to world (cm) ---
     # The whole point of the homography is that we stop reasoning in
@@ -410,8 +651,10 @@ def _process_frame(frame, model, trail, state):
         # Pull the apparent position back toward the nadir by a constant
         # fraction; with the camera near the table centre this is a fine
         # first-order fix.
-        nadir = np.asarray(CAMERA_NADIR_CM, dtype=float)
-        raw_center = nadir + (1.0 - PARALLAX_FACTOR) * (np.asarray(raw_center, dtype=float) - nadir)
+        nadir = np.asarray(state["tun_camera_nadir_cm"], dtype=float)
+        raw_center = nadir + (1.0 - state["tun_parallax_factor"]) * (
+            np.asarray(raw_center, dtype=float) - nadir
+        )
         raw_center_arr = np.asarray(raw_center, dtype=float)
         raw_theta_cs = np.array(
             [math.cos(math.radians(raw_theta)), math.sin(math.radians(raw_theta))]
@@ -460,11 +703,13 @@ def _process_frame(frame, model, trail, state):
     if robot_center_cm is not None and theta is not None:
         heading = math.radians(theta)
         right   = heading + math.pi / 2.0
+        fwd_cm = state["tun_gripper_forward_cm"]
+        rt_cm  = state["tun_gripper_right_cm"]
         gripper_xy_cm = (
-            float(robot_center_cm[0]) + GRIPPER_FORWARD_CM * math.cos(heading)
-                                      + GRIPPER_RIGHT_CM   * math.cos(right),
-            float(robot_center_cm[1]) + GRIPPER_FORWARD_CM * math.sin(heading)
-                                      + GRIPPER_RIGHT_CM   * math.sin(right),
+            float(robot_center_cm[0]) + fwd_cm * math.cos(heading)
+                                      + rt_cm  * math.cos(right),
+            float(robot_center_cm[1]) + fwd_cm * math.sin(heading)
+                                      + rt_cm  * math.sin(right),
         )
 
     # BGR colors per class color name
@@ -483,16 +728,20 @@ def _process_frame(frame, model, trail, state):
     # decisions from. The robot's own body keeps getting tagged as a faint
     # "green field" at ~0.4, which would derail planning. We still draw the
     # box dimmed so we can see what the model is doing.
-    BRIDGE_CONF_MIN = 0.55
+    BRIDGE_CONF_MIN = 0.35
 
-    for box in results.boxes:
+    for box in scaled_boxes:
         cls = int(box.cls[0])
         name = results.names[cls]
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         conf = float(box.conf[0])
 
-        parts = name.lower().split()
+        # Class names come from the YOLO model and have varied between
+        # training runs: some used "red field" with a space, the latest
+        # uses "red_field" with an underscore. Normalise both so we
+        # don't silently ignore everything when the model changes.
+        parts = name.lower().replace("_", " ").split()
         accepted = conf >= BRIDGE_CONF_MIN
         if len(parts) == 2 and accepted:
             color, kind = parts
@@ -556,6 +805,11 @@ def _process_frame(frame, model, trail, state):
     path_to_field = []     # pixel waypoints
 
     if target_det is not None and robot_center_cm is not None:
+        if state.get("_path_debug_frames", 0) % 60 == 0:
+            print(f"[DBG] A* try: target_color={target_det.color} "
+                  f"target_center_px={target_det.center} "
+                  f"frame_shape={frame.shape[:2]}")
+        state["_path_debug_frames"] = state.get("_path_debug_frames", 0) + 1
         # A* needs the robot's pixel centre; we keep it in `state` for
         # exactly this kind of round-trip use.
         last_pixel_center = None
@@ -590,7 +844,16 @@ def _process_frame(frame, model, trail, state):
                 grid1 = build_occupancy_grid(frame.shape, all_detections, target_det, **kwargs)
                 path_to_block = astar(grid1, rc_px, target_det.center)
                 if path_to_block:
+                    if state.get("_path_debug_frames", 0) % 60 == 0:
+                        print(f"[DBG] A* OK at scale={scale}, "
+                              f"len={len(path_to_block)}, "
+                              f"start={rc_px}, end={target_det.center}")
                     break
+            else:
+                if state.get("_path_debug_frames", 0) % 60 == 0:
+                    print(f"[DBG] A* FAILED at all scales. "
+                          f"rc_px={rc_px}, target={target_det.center}, "
+                          f"robot_radius_px={robot_radius_px}")
 
             if field_det is not None:
                 for scale in scales:
@@ -690,12 +953,80 @@ def _process_frame(frame, model, trail, state):
             "fields_by_color": {
                 color: _bxy(d.center) for color, d in fields_by_color.items()
             },
+            # Field rectangles in world cm. The bridge uses these to filter
+            # out cubes already physically inside their target field (see
+            # `_nearest_block_of_color` in bridge.py). The xyxy is in pixel
+            # space, so both corners get the homography pass. After warping,
+            # (x1, y1) and (x2, y2) aren't guaranteed to be the geometric
+            # min/max corners anymore — `_box_contains` normalises that.
+            "field_boxes_by_color": {
+                color: (
+                    *_bxy((d.xyxy[0], d.xyxy[1])),
+                    *_bxy((d.xyxy[2], d.xyxy[3])),
+                )
+                for color, d in fields_by_color.items()
+            },
             "path_to_block": [_bxy(p) for p in path_to_block],
             "path_to_field": [_bxy(p) for p in path_to_field],
         }
+        # BLE link state-transition guard. If the link just came back up
+        # after being down, the bridge was still ticking and may want to
+        # fire a queued MOVE/TURN the instant the radio reattaches —
+        # which is how we ended up with the robot suddenly lurching after
+        # every reconnect. Force the bridge into AWAITING_START on the
+        # *fall* (down) so it stops emitting commands; the operator has
+        # to physically press SPACE to resume. This is the safest
+        # behaviour: pause means pause.
+        #
+        # Computed here (before bridge.next_command) instead of in the
+        # HUD block lower down, because the cmd-gate below needs it too
+        # and the HUD path only runs when robot_center is visible.
+        ble_live = bool(
+            _robot is not None
+            and getattr(_robot, "_client", None) is not None
+            and _robot._client.is_connected
+        )
+        state["robot_connected"] = ble_live
+
+        # BLE link state-transition guard. Bridge state is PRESERVED
+        # across drops — the operator asked for the flow to resume
+        # automatically when the link comes back, no SPACE re-press.
+        # We still suppress commands while the radio is down so they
+        # don't queue up; on reconnect we send a single STOP to make
+        # sure the ESP wasn't mid-pulse, then let bridge.next_command
+        # take over from whatever state it's in.
+        _last_command_at_reset = False
+        was_live = state.get("_prev_ble_live")
+        if was_live is None:
+            state["_prev_ble_live"] = ble_live
+        elif was_live and not ble_live:
+            print("[WP4] BLE link dropped — commands suppressed until reconnect.")
+            state["_prev_ble_live"] = False
+            # Reset throttle so the first command after reconnect doesn't
+            # have a stale `_last_command_at` that allows an instant
+            # double-fire when the radio reattaches.
+            _last_command_at_reset = True
+        elif (not was_live) and ble_live:
+            _send_to_robot("STOP")
+            print(f"[WP4] BLE link restored — resuming bridge state {_bridge.state}.")
+            state["_prev_ble_live"] = True
+            _last_command_at_reset = True
+
         cmd = _bridge.next_command(vision)
         global _last_command_at, _last_command_str
         now = time.monotonic()
+        if _last_command_at_reset:
+            # Pretend we just sent a command, so the throttle (next 2 s
+            # window) lets the chassis settle / lets us read marker
+            # fresh before anything new goes out on the wire.
+            _last_command_at = now
+
+        # Don't send anything if the radio is down. Bridge ticks freely
+        # (state machine still advances on its own) but the wire is
+        # gated; otherwise we'd be queueing commands the ESP never sees
+        # and then dumping them all at once on reconnect.
+        if not ble_live:
+            cmd = None
 
         # Throttle: send a new MOVE/TURN/GRIP at most every COMMAND_INTERVAL_SEC.
         # State-transition pulses slip through immediately:
@@ -713,8 +1044,23 @@ def _process_frame(frame, model, trail, state):
         )
         if cmd is not None and (is_urgent or now - _last_command_at >= COMMAND_INTERVAL_SEC):
             _send_to_robot(cmd)
-            _last_command_at = now
+            # Big TURN (>=12°): chassis is still rotating + ArUco needs
+            # a clean frame, +1 s of quiet. Everything else uses the
+            # base COMMAND_INTERVAL_SEC.
+            extra_wait = 0.0
+            if cmd.startswith("TURN "):
+                try:
+                    deg = abs(int(cmd[5:]))
+                    if deg >= 12:
+                        extra_wait = 1.0
+                except ValueError:
+                    pass
+            _last_command_at = now + extra_wait
             _last_command_str = cmd
+            # Mirror to state so the dashboard's status panel can show
+            # the most recent command. The OpenCV HUD reads the global;
+            # the dashboard reads the state key. Same value either way.
+            state["last_command_str"] = cmd
 
         # HUD: show the most recent command we actually sent, plus current state.
         if _last_command_str is not None:
@@ -725,6 +1071,16 @@ def _process_frame(frame, model, trail, state):
         if _bridge.target_color:
             cv2.putText(frame, f"target: {_bridge.target_color}", (10, 78),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        # BLE link indicator — top-right. ble_live was already computed
+        # above (we need it for the cmd-gate before bridge.next_command)
+        # so just render it here.
+        h_img_top, w_img_top = frame.shape[:2]
+        dot_color = (0, 200, 0) if ble_live else (0, 0, 220)
+        ble_text  = "BLE LIVE" if ble_live else "BLE DOWN"
+        cv2.circle(frame, (w_img_top - 130, 30), 10, dot_color, -1)
+        cv2.circle(frame, (w_img_top - 130, 30), 10, (255, 255, 255), 2)
+        cv2.putText(frame, ble_text, (w_img_top - 110, 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, dot_color, 2)
         # Operator hints — only when relevant so they don't clutter the
         # display once the flow is running.
         if _bridge.state == "AWAITING_START":
@@ -734,7 +1090,107 @@ def _process_frame(frame, model, trail, state):
             cv2.putText(frame, "press R to RESET (re-align)", (10, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
+    # Live-tune readout — current values + key hints. Bottom-left so it
+    # doesn't fight with state/target labels at the top-left.
+    tune_lines = [
+        f"FWD={state['tun_gripper_forward_cm']:+.1f}cm  RT={state['tun_gripper_right_cm']:+.1f}cm",
+        f"PARALLAX={state['tun_parallax_factor']:.3f}  NADIR=({state['tun_camera_nadir_cm'][0]:.0f},{state['tun_camera_nadir_cm'][1]:.0f})",
+        "W/S=fwd  A/D=right  -/+=parallax  N=set nadir  K=save",
+    ]
+    h_img = frame.shape[0]
+    for i, line in enumerate(tune_lines):
+        cv2.putText(frame, line, (10, h_img - 20 - (len(tune_lines) - 1 - i) * 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+    if state.get("pending_nadir_click_world") == "armed":
+        cv2.putText(frame, "CLICK to set NADIR", (10, h_img - 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
     cv2.imshow("Sortify - Real-time Detection", frame)
+
+    # --- session recording (smooth playback) ---
+    # Last time we tried this we hard-coded 20 fps and the vision loop
+    # only managed 3-5 fps, so every frame got duplicated 4-7× and the
+    # video played back as a slide show. Fix: tag the writer with the
+    # ACTUAL running FPS (from the EMA we already maintain for the
+    # HUD) so 1 vision tick = 1 video frame. Playback speed will match
+    # real time. We downscale to 1280 wide to keep the file size sane
+    # — full 4K is overkill for a demo recording.
+    REC_TARGET_W = 1280
+    writer = state.get("video_writer")
+    if writer is None and not state.get("video_skip"):
+        # Wait until we have a reasonable FPS reading before opening
+        # the writer — otherwise we'd seed it with the bootstrap 0.0.
+        fps_now = float(state.get("fps") or 0.0)
+        if fps_now >= 2.0:
+            import os, time as _t
+            h_full, w_full = frame.shape[:2]
+            scale = min(1.0, REC_TARGET_W / w_full)
+            w_v = int(w_full * scale)
+            h_v = int(h_full * scale)
+            os.makedirs("recordings", exist_ok=True)
+            out_path = f"recordings/session_{int(_t.time())}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(out_path, fourcc, fps_now, (w_v, h_v))
+            if writer.isOpened():
+                state["video_writer"] = writer
+                state["video_path"] = out_path
+                state["video_scale"] = scale
+                state["video_size"] = (w_v, h_v)
+                print(f"[WP4] Recording to {out_path} at {fps_now:.1f} fps, "
+                      f"{w_v}x{h_v}")
+            else:
+                print("[WP4] WARN: VideoWriter wouldn't open; recording disabled.")
+                state["video_skip"] = True
+                writer = None
+    if writer is not None:
+        scale = state.get("video_scale", 1.0)
+        if scale != 1.0:
+            w_v, h_v = state["video_size"]
+            rec_frame = cv2.resize(frame, (w_v, h_v), interpolation=cv2.INTER_AREA)
+        else:
+            rec_frame = frame
+        writer.write(rec_frame)
+
+    # --- dashboard JPEG hand-off ---
+    # Encode at q=60 only if a browser is actually subscribed; the encode
+    # is the expensive bit (~5-15 ms on a 4K frame) so we don't pay for
+    # it when nobody's watching. We downscale to 1280-wide first — the
+    # dashboard is showing a thumbnail in a browser, full 4K is overkill
+    # and bumps frame-rate noticeably.
+    if state.get("dashboard_subscribers", 0) > 0:
+        dash_h, dash_w = frame.shape[:2]
+        DASH_TARGET_W = 1280
+        if dash_w > DASH_TARGET_W:
+            dash_scale = DASH_TARGET_W / dash_w
+            dash_frame = cv2.resize(
+                frame, (DASH_TARGET_W, int(dash_h * dash_scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            dash_frame = frame
+        ok, jpg = cv2.imencode(".jpg", dash_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        if ok:
+            lock = state.get("frame_lock")
+            payload = jpg.tobytes()
+            now = time.monotonic()
+            if lock is not None:
+                with lock:
+                    state["latest_jpeg"] = payload
+                    state["latest_jpeg_ts"] = now
+            else:
+                state["latest_jpeg"] = payload
+                state["latest_jpeg_ts"] = now
+
+    # FPS EMA for the dashboard. Cheap; one float, no allocations.
+    now = time.monotonic()
+    last_t = state.get("_fps_last_t")
+    if last_t is not None:
+        dt = now - last_t
+        if dt > 1e-3:
+            inst = 1.0 / dt
+            prev = state.get("fps")
+            state["fps"] = inst if prev is None else 0.85 * prev + 0.15 * inst
+    state["_fps_last_t"] = now
 
 
 if __name__ == "__main__":
