@@ -203,6 +203,30 @@ _HTML = """<!doctype html>
           <input id="t-nx" type="text" style="width:60px" onchange="tuneNadir()">
           <input id="t-ny" type="text" style="width:60px" onchange="tuneNadir()">
         </div>
+        <div class="row" style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
+          <label>red →</label>
+          <select id="r-red" onchange="routeChange()">
+            <option value="red">red field</option>
+            <option value="blue">blue field</option>
+            <option value="green">green field</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>blue →</label>
+          <select id="r-blue" onchange="routeChange()">
+            <option value="red">red field</option>
+            <option value="blue">blue field</option>
+            <option value="green">green field</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>green →</label>
+          <select id="r-green" onchange="routeChange()">
+            <option value="red">red field</option>
+            <option value="blue">blue field</option>
+            <option value="green">green field</option>
+          </select>
+        </div>
         <div class="row">
           <button onclick="saveTun()">Save tunables.json</button>
           <button onclick="resetTun()">Reset to defaults</button>
@@ -272,6 +296,17 @@ _HTML = """<!doctype html>
     const y = parseFloat($('t-ny').value);
     if (!isNaN(x) && !isNaN(y)) postJSON('/tune', {camera_nadir_cm: [x, y]});
   }
+  function routeChange() {
+    markEditing();
+    const routing = {
+      red:   $('r-red').value,
+      blue:  $('r-blue').value,
+      green: $('r-green').value,
+    };
+    postJSON('/tune', {color_routing: routing}).then(() => {
+      log(`route r→${routing.red} b→${routing.blue} g→${routing.green}`);
+    });
+  }
   function saveTun()  { postJSON('/save_tunables').then(() => log('tunables saved')); }
   function resetTun() { postJSON('/reset_tunables').then(() => log('tunables reset')); }
   async function reconnect() {
@@ -318,6 +353,11 @@ _HTML = """<!doctype html>
         $('t-par').value = t.parallax_factor;     $('v-par').textContent = (+t.parallax_factor).toFixed(3);
         if (document.activeElement !== $('t-nx')) $('t-nx').value = (+t.camera_nadir_cm[0]).toFixed(1);
         if (document.activeElement !== $('t-ny')) $('t-ny').value = (+t.camera_nadir_cm[1]).toFixed(1);
+        if (t.color_routing) {
+          if (document.activeElement !== $('r-red'))   $('r-red').value   = t.color_routing.red || 'red';
+          if (document.activeElement !== $('r-blue'))  $('r-blue').value  = t.color_routing.blue || 'blue';
+          if (document.activeElement !== $('r-green')) $('r-green').value = t.color_routing.green || 'green';
+        }
       }
       if (s.target_color && document.activeElement !== $('target-sel')) {
         $('target-sel').value = s.target_color;
@@ -372,6 +412,8 @@ def _build_status() -> dict:
             "gripper_right_cm":   s.get("tun_gripper_right_cm"),
             "parallax_factor":    s.get("tun_parallax_factor"),
             "camera_nadir_cm":    list(s.get("tun_camera_nadir_cm", (0.0, 0.0))),
+            "color_routing":      dict(s.get("tun_color_routing")
+                                       or {"red": "red", "blue": "blue", "green": "green"}),
         },
     }
 
@@ -540,6 +582,20 @@ class _Handler(BaseHTTPRequestHandler):
             if isinstance(v, (list, tuple)) and len(v) == 2:
                 _STATE["tun_camera_nadir_cm"] = (float(v[0]), float(v[1]))
                 changed["camera_nadir_cm"] = list(_STATE["tun_camera_nadir_cm"])
+        if "color_routing" in body:
+            v = body["color_routing"]
+            VALID = ("red", "blue", "green")
+            if isinstance(v, dict):
+                # Merge into the live routing dict, validating both sides.
+                routing = dict(_STATE.get("tun_color_routing")
+                               or {"red": "red", "blue": "blue", "green": "green"})
+                for k, dest in v.items():
+                    if str(k).lower() in VALID and str(dest).lower() in VALID:
+                        routing[str(k).lower()] = str(dest).lower()
+                _STATE["tun_color_routing"] = routing
+                if _BRIDGE is not None:
+                    _BRIDGE.set_color_routing(routing)
+                changed["color_routing"] = routing
         return {"ok": True, "changed": changed}
 
     # ---- MJPEG ----

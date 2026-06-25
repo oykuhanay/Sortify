@@ -174,6 +174,12 @@ class Bridge:
     state: str = State.AWAITING_START
     target_color: Optional[str] = None
     gripper_open: bool = False        # mac-side cache of last gripper command
+    # block_color -> dest field_color. Default identity (red->red etc).
+    # Override via Bridge.set_color_routing({"red":"blue", ...}) for
+    # cross-color sorting demos.
+    color_routing: dict = field(default_factory=lambda: {
+        "red": "red", "blue": "blue", "green": "green",
+    })
     _action_started_at: float = field(default=0.0)
     _stop_sent: bool = False
     _backoff_sent: bool = False
@@ -185,6 +191,18 @@ class Bridge:
         self._action_started_at = 0.0
         self._stop_sent = False
         self._backoff_sent = False
+
+    def set_color_routing(self, routing: dict) -> None:
+        """Update block->field colour routing. Unknown keys are ignored;
+        unspecified colours keep their previous mapping."""
+        for k, v in (routing or {}).items():
+            if k in ("red", "blue", "green") and v in ("red", "blue", "green"):
+                self.color_routing[k] = v
+
+    def _dest_color(self, block_color: Optional[str]) -> Optional[str]:
+        if block_color is None:
+            return None
+        return self.color_routing.get(block_color, block_color)
 
     def start(self) -> None:
         """Operator pressed START — leave AWAITING_START and run the flow."""
@@ -228,7 +246,7 @@ class Bridge:
         # picked up the green pair after we'd exhausted red) we should
         # leave IDLE and try again instead of just sitting there.
         if self.state == State.IDLE:
-            if _pick_target_color(vision) is not None:
+            if _pick_target_color(vision, self.color_routing) is not None:
                 print("[BRIDGE] IDLE -> SEEKING_BLOCK (new candidate visible)")
                 self.state = State.SEEKING_BLOCK
                 self.target_color = None     # re-pick in the next tick
@@ -248,12 +266,15 @@ class Bridge:
     def _tick_seeking_block(self, vision, robot_xy, theta, gripper_xy) -> Optional[str]:
         # Pick a target colour if we don't have one yet.
         if self.target_color is None:
-            self.target_color = _pick_target_color(vision)
+            self.target_color = _pick_target_color(vision, self.color_routing)
             if self.target_color is None:
                 self.state = State.IDLE
                 return None
 
-        block_xy = _nearest_block_of_color(vision, self.target_color, robot_xy)
+        block_xy = _nearest_block_of_color(
+            vision, self.target_color, robot_xy,
+            dest_color=self._dest_color(self.target_color),
+        )
         if block_xy is None:
             # Vision lost the cube. There are two flavours of this:
             #
@@ -314,7 +335,10 @@ class Bridge:
             self.state = State.SEEKING_BLOCK
             return None
 
-        field_xy = (vision.get("fields_by_color") or {}).get(self.target_color)
+        # Cross-colour routing: the cube we picked up is target_color, but
+        # we drop it on whatever field the operator routed it to.
+        dest_color = self._dest_color(self.target_color)
+        field_xy = (vision.get("fields_by_color") or {}).get(dest_color)
         if field_xy is None:
             # Field briefly out of view; keep holding, don't drive blindly.
             return None
@@ -327,7 +351,7 @@ class Bridge:
         # the colour. FIELD_RELEASE_INSET_CM pulls the trigger zone
         # inward so the cube lands well clear of the edge.
         FIELD_RELEASE_INSET_CM = 2.0
-        field_box = (vision.get("field_boxes_by_color") or {}).get(self.target_color)
+        field_box = (vision.get("field_boxes_by_color") or {}).get(dest_color)
         if field_box is not None:
             x1, y1, x2, y2 = field_box
             xmin, xmax = min(x1, x2), max(x1, x2)
@@ -516,7 +540,7 @@ def _format_move(cm: float) -> str:
     return f"MOVE {sign}{abs(cm):05.2f}"
 
 
-def _pick_target_color(vision: dict) -> Optional[str]:
+def _pick_target_color(vision: dict, routing: Optional[dict] = None) -> Optional[str]:
     """Pick the highest-priority colour that has at least one cube NOT
     already sitting on its matching field. Without the bbox filter we'd
     forever re-pick `red` once the red cube is sorted: there's still a
@@ -528,14 +552,21 @@ def _pick_target_color(vision: dict) -> Optional[str]:
     fields_by_color = vision.get("fields_by_color") or {}
     field_boxes_by_color = vision.get("field_boxes_by_color") or {}
     for color in COLOR_PRIORITY:
-        if color not in fields_by_color:
+        # Where would a cube of this colour actually be dropped? With
+        # default identity routing this is just `color`; under
+        # cross-colour routing it may be a different field.
+        dest = (routing or {}).get(color, color)
+        if dest not in fields_by_color:
             continue
         cubes = blocks_by_color.get(color) or []
         if not cubes:
             continue
         # Use the same containment logic as _nearest_block_of_color so
-        # the two never disagree about whether a cube is sorted.
-        field_box = field_boxes_by_color.get(color)
+        # the two never disagree about whether a cube is sorted. We
+        # check the ROUTED destination field's bbox, not the cube's
+        # own colour, so a red cube routed to blue is "sorted" when
+        # it's sitting on the blue field.
+        field_box = field_boxes_by_color.get(dest)
         unsorted_exists = False
         for b in cubes:
             if field_box is not None:
@@ -554,20 +585,21 @@ def _pick_target_color(vision: dict) -> Optional[str]:
 
 
 def _nearest_block_of_color(
-    vision: dict, color: str, robot_xy: Point
+    vision: dict, color: str, robot_xy: Point,
+    dest_color: Optional[str] = None,
 ) -> Optional[Point]:
     """Pick the nearest cube of `color` that isn't already sitting on
-    its matching field. The 'already sorted' check uses the field's
+    its destination field. The 'already sorted' check uses the field's
     bounding BOX (with a small inward inset) rather than distance to
     the field's centre — fields are big rectangles and the cube can
-    land anywhere on them, including near the edges, so a centre-
-    distance check would re-target a cube we just dropped on the
-    field corner."""
+    land anywhere on them. Under cross-colour routing, `dest_color`
+    is where the cube goes (e.g. red->blue); defaults to `color`."""
     blocks = (vision.get("blocks_by_color") or {}).get(color) or []
     if not blocks:
         return None
-    field_box = (vision.get("field_boxes_by_color") or {}).get(color)
-    field_xy = (vision.get("fields_by_color") or {}).get(color)
+    dest = dest_color or color
+    field_box = (vision.get("field_boxes_by_color") or {}).get(dest)
+    field_xy = (vision.get("fields_by_color") or {}).get(dest)
     candidates = []
     for b in blocks:
         # Primary filter: cube physically on its destination field.

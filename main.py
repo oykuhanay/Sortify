@@ -260,6 +260,8 @@ def _reset_tunables(state: dict) -> None:
     state["tun_gripper_right_cm"]   = GRIPPER_RIGHT_CM
     state["tun_parallax_factor"]    = PARALLAX_FACTOR
     state["tun_camera_nadir_cm"]    = CAMERA_NADIR_CM
+    state["tun_color_routing"]      = {"red": "red", "blue": "blue", "green": "green"}
+    _bridge.set_color_routing(state["tun_color_routing"])
     print("[WP4] Tunables reset to module defaults (not saved).")
 
 
@@ -272,6 +274,8 @@ def _save_tunables(state: dict) -> None:
         "parallax_factor":    float(state["tun_parallax_factor"]),
         "camera_nadir_cm":    [float(state["tun_camera_nadir_cm"][0]),
                                float(state["tun_camera_nadir_cm"][1])],
+        "color_routing":      dict(state.get("tun_color_routing")
+                                   or {"red": "red", "blue": "blue", "green": "green"}),
     }
     try:
         with open(TUNABLES_PATH, "w") as f:
@@ -331,9 +335,16 @@ def run_detection(source, detection_model_path):
         "tun_gripper_right_cm":   tunables.get("gripper_right_cm",   GRIPPER_RIGHT_CM),
         "tun_parallax_factor":    tunables.get("parallax_factor",    PARALLAX_FACTOR),
         "tun_camera_nadir_cm":    tuple(tunables.get("camera_nadir_cm", CAMERA_NADIR_CM)),
+        # block_color -> dest field_color. Persisted so cross-colour demo
+        # setups survive a restart.
+        "tun_color_routing":      dict(tunables.get("color_routing")
+                                       or {"red": "red", "blue": "blue", "green": "green"}),
         # Last-clicked pixel (for setting nadir by click).
         "pending_nadir_click_world": None,
     }
+    # Apply persisted routing to the bridge so a restart picks up cross-
+    # colour configs without needing the dashboard touched again.
+    _bridge.set_color_routing(state["tun_color_routing"])
 
     # Launch the localhost dashboard. Opt-in: if it can't bind (port
     # taken, sandbox, whatever) the demo still runs from the OpenCV
@@ -626,7 +637,7 @@ def _process_frame(frame, model, trail, state):
     # big coloured fields (they fell outside the size distribution it
     # was trained on) and the demo broke. Keep the full frame; we'll
     # claw back FPS elsewhere (Iriun resolution, dashboard subsampling).
-    results = model(frame, verbose=False)[0]
+    results = model(frame, verbose=False, imgsz=1280, rect=True)[0]
     scaled_boxes = list(results.boxes)
 
     # --- detect robot marker, then convert everything to world (cm) ---
