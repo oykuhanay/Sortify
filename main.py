@@ -790,16 +790,25 @@ def _process_frame(frame, model, trail, state):
     best_key = (float("inf"), float("inf"))
     robot_center_for_dist_cm = robot_center_cm
 
+    # Cross-colour routing: a cube of colour C goes to the routed
+    # destination field, not necessarily the field of its own colour.
+    # The path overlay + A* must use the routed field too, otherwise
+    # the orange line keeps pointing at the cube's own-colour field
+    # even though the bridge is heading somewhere else.
+    routing = getattr(_bridge, "color_routing", None) or {
+        "red": "red", "blue": "blue", "green": "green"
+    }
     for color, dets in blocks_by_color.items():
-        if color not in fields_by_color:
+        dest_color = routing.get(color, color)
+        if dest_color not in fields_by_color:
             continue
         priority = COLOR_PRIORITY.get(color, 99)
-        f = fields_by_color[color]
+        f = fields_by_color[dest_color]
         fx1, fy1, fx2, fy2 = f.xyxy
         for det in dets:
             cx, cy = det.center
             if fx1 <= cx <= fx2 and fy1 <= cy <= fy2:
-                continue  # already in its field
+                continue  # already on the routed destination field
             if robot_center_for_dist_cm is not None:
                 det_cm = _to_world(H, np.array([det.center]))[0]
                 d = float(np.linalg.norm(det_cm - robot_center_for_dist_cm))
