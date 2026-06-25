@@ -36,6 +36,19 @@ GRIPPER_RIGHT_CM   = 0.0    # chassis is symmetric; any side-drift is parallax (
 # stop/edit/start loop took 30-40 seconds per nudge.
 TUNABLES_PATH = "tunables.json"
 
+# Detection cache: if YOLO drops a class for a frame or two we keep
+# publishing the last known position to bridge so it doesn't stall on
+# transient flicker. Fields are stationary so 5 s of "object permanence"
+# is safe; blocks shouldn't move on their own either but we keep the
+# window shorter (3 s) so a grabbed cube doesn't haunt the cache for
+# too long if the GRABBING wipe ever races with a stale frame.
+DETECTION_TTL_SEC_FIELD = 5.0
+DETECTION_TTL_SEC_BLOCK = 3.0
+# Distance gate for matching a "live" block detection to a cached one,
+# so the same physical cube updates its cached entry instead of piling
+# up as a duplicate. 6 cm covers normal YOLO bbox jitter on our table.
+BLOCK_CACHE_MATCH_CM = 6.0
+
 # Parallax correction.
 #
 # The homography flattens the table plane perfectly — but the marker
@@ -341,6 +354,16 @@ def run_detection(source, detection_model_path):
                                        or {"red": "red", "blue": "blue", "green": "green"}),
         # Last-clicked pixel (for setting nadir by click).
         "pending_nadir_click_world": None,
+        # Per-colour detection cache. YOLO flickers between frames —
+        # field/block briefly drops to 0 detections then comes back.
+        # We remember the last fresh detection per (color, kind) and
+        # re-publish it as long as it's not staler than DETECTION_TTL_SEC.
+        # Layout:
+        #   det_cache["fields"][color]  = {"xy":(x,y), "bbox":(x1,y1,x2,y2), "ts":t}
+        #   det_cache["blocks"][color]  = [{"xy":(x,y), "ts":t}, ...]
+        # GRABBING wipes the target-colour block entry so the
+        # vision-lost-after-STOP commit logic still triggers correctly.
+        "det_cache": {"fields": {}, "blocks": {}},
     }
     # Apply persisted routing to the bridge so a restart picks up cross-
     # colour configs without needing the dashboard touched again.
@@ -993,6 +1016,86 @@ def _process_frame(frame, model, trail, state):
             "path_to_block": [_bxy(p) for p in path_to_block],
             "path_to_field": [_bxy(p) for p in path_to_field],
         }
+
+        # --- Detection cache: object-permanence for flickering YOLO ---
+        # Fields are stationary; blocks are too (until grabbed). When
+        # YOLO drops a class for a frame, fall back to the last known
+        # world-cm pose so the bridge doesn't briefly think there's
+        # nothing to chase.
+        det_cache = state["det_cache"]
+        cache_now = time.monotonic()
+        # If we just transitioned into GRABBING, the cube we were
+        # chasing is now (probably) in the jaws and the camera can't
+        # see it. Don't let the cache hand the bridge a phantom block
+        # to drive towards — wipe the target colour's block cache.
+        if _bridge.state == "GRABBING" and _bridge.target_color:
+            det_cache["blocks"].pop(_bridge.target_color, None)
+
+        # Fields: simple per-colour upsert + TTL fallback.
+        for color, d in fields_by_color.items():
+            det_cache["fields"][color] = {
+                "xy":   _bxy(d.center),
+                "bbox": (*_bxy((d.xyxy[0], d.xyxy[1])),
+                         *_bxy((d.xyxy[2], d.xyxy[3]))),
+                "ts":   cache_now,
+            }
+        for color, entry in list(det_cache["fields"].items()):
+            if color in vision["fields_by_color"]:
+                continue   # live this frame, nothing to fill
+            age = cache_now - entry["ts"]
+            if age <= DETECTION_TTL_SEC_FIELD:
+                vision["fields_by_color"][color] = entry["xy"]
+                vision["field_boxes_by_color"][color] = entry["bbox"]
+            else:
+                det_cache["fields"].pop(color, None)
+
+        # Blocks: match each live detection to its nearest cached
+        # entry (under BLOCK_CACHE_MATCH_CM) so the same physical cube
+        # updates its row, then refill missing entries from the cache
+        # until TTL.
+        for color, dets in blocks_by_color.items():
+            live_xys = [_bxy(d.center) for d in dets]
+            cache_list = det_cache["blocks"].get(color, [])
+            # Mark cache rows fresh if a live detection is near them.
+            unmatched_cache = list(range(len(cache_list)))
+            updated = [False] * len(cache_list)
+            for lx, ly in live_xys:
+                # Find nearest unused cache row.
+                best_i = -1
+                best_d = float("inf")
+                for ci in unmatched_cache:
+                    cx, cy = cache_list[ci]["xy"]
+                    d = ((lx - cx) ** 2 + (ly - cy) ** 2) ** 0.5
+                    if d < best_d:
+                        best_d = d
+                        best_i = ci
+                if best_i >= 0 and best_d <= BLOCK_CACHE_MATCH_CM:
+                    cache_list[best_i] = {"xy": (lx, ly), "ts": cache_now}
+                    updated[best_i] = True
+                    unmatched_cache.remove(best_i)
+                else:
+                    cache_list.append({"xy": (lx, ly), "ts": cache_now})
+                    updated.append(True)
+            det_cache["blocks"][color] = cache_list
+
+        # Now publish: for each cached colour, if vision is empty this
+        # frame OR is missing some cubes that the cache still remembers
+        # under TTL, top up the list.
+        for color, cache_list in list(det_cache["blocks"].items()):
+            fresh = [e for e in cache_list
+                     if cache_now - e["ts"] <= DETECTION_TTL_SEC_BLOCK]
+            det_cache["blocks"][color] = fresh
+            if not fresh:
+                det_cache["blocks"].pop(color, None)
+                continue
+            live_xys = vision["blocks_by_color"].get(color, [])
+            for entry in fresh:
+                ex, ey = entry["xy"]
+                if any(((ex - lx) ** 2 + (ey - ly) ** 2) ** 0.5
+                       <= BLOCK_CACHE_MATCH_CM for lx, ly in live_xys):
+                    continue   # already represented in live
+                live_xys.append((ex, ey))
+            vision["blocks_by_color"][color] = live_xys
         # BLE link state-transition guard. If the link just came back up
         # after being down, the bridge was still ticking and may want to
         # fire a queued MOVE/TURN the instant the radio reattaches —
